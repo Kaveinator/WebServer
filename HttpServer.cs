@@ -367,5 +367,11 @@ namespace WebServer {
             if (!TryRegisterArea(areaInitializer, out area))
                 throw new Exception($"Failed to bind {typeof(T).FullName}! Is your initializer returning a valid area?");
         }
+
+        public T RegisterArea<T>(Func<T>? areaInitializer) where T : AreaBase {
+            if (!TryRegisterArea(areaInitializer, out T area))
+                throw new Exception($"Failed to bind {typeof(T).FullName}! Is your initializer returning a valid area?");
+            return area;
+        }
     }
 }
