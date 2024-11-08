@@ -223,7 +223,7 @@ namespace WebServer {
                 }
                 foreach (var kvp in response.Headers) {
                     if (kvp.Value is null)
-                        context.Response.Headers.Add(kvp.Key);
+                        try { context.Response.Headers.Add(kvp.Key); } catch {}
                     else context.Response.Headers.Add(kvp.Key, kvp.Value);
                 }
                 bool omitBody = new[] { "HEAD", "PUT", "DELETE" }.Contains(context.Request.HttpMethod.ToUpper()) ||
@@ -243,7 +243,7 @@ namespace WebServer {
                 // And finally, if the response allows cache (by being a cachedResponse)
                 //  override the path that it is on, so it can be reused
                 if (response is CachedResponse cachedResponse) {
-                    cachedResponse.Path = $"{host}{path}"; // Rewrite the path, so it can be located when a new request is received
+                    cachedResponse.Path ??= $"{host}{path}"; // Rewrite the path, so it can be located when a new request is received
                     if (Config.DebugMode) cachedResponse.RaiseUpdateFlag();
                 }
             }
@@ -252,20 +252,23 @@ namespace WebServer {
             }
         }
 
-        static string FormatCallbackKey(string key)
+        public static string FormatCallbackKey(string key)
             => string.IsNullOrEmpty(key) ? string.Empty
                 : key.ToLower().Replace('\\', '/').Replace("//", "/").Trim(' ', '/');
 
         public async Task<HttpResponse> GetStaticFile(HttpListenerContext context, CachedResponse? cache) => await GetStaticFile(context.Request.Url?.Host, context.Request.Url?.LocalPath, cache);
 
         public async Task<HttpResponse> GetStaticFile(string? targetDomain, string? localPath, CachedResponse? cache) {
-            if (!cache?.NeedsUpdate ?? false) return cache;
+            targetDomain = (targetDomain ?? Config.DefaultDomain).Trim('/', ' ').ToLowerInvariant();
+            string cacheKey = $"{targetDomain}/{FormatCallbackKey(localPath ?? "")}";
+            if (cache is null)
+                cache = CachedResponse.Get(this, $"{targetDomain}{cacheKey}");
+            if (!(cache?.NeedsUpdate ?? true)) return cache;
             string? fileName = Path.GetFileName(localPath);
             if (fileName != null && fileName.StartsWith('_') && fileName.EndsWith(".cshtml")) // Is the file a private cshtml file?
                 localPath = localPath?.Substring(0, localPath.Length - fileName.Length);
             DirectoryInfo directory = ViewsDirectory; // Might be changed later
             // Works on windows, but on linux, the domain folder will need to be lowercase
-            targetDomain = targetDomain?.ToLower() ?? Config.DefaultDomain;
             string basePath = Path.Combine(directory.FullName, targetDomain);
             bool usingFallbackDomain = !Directory.Exists(basePath);
             if (usingFallbackDomain) { // Only fallback to default if domain folder doesn't exist
@@ -273,7 +276,9 @@ namespace WebServer {
                 basePath = Path.Combine(directory.FullName, Config.DefaultDomain);
             }
             string resourceIdentifier = FormatCallbackKey(localPath ?? string.Empty);
-            CachedResponse resource = cache ?? new CachedResponse(this, null);
+            CachedResponse resource = cache ?? new CachedResponse(this, null) {
+                Path = cacheKey
+            };
             string filePath = Path.Combine(basePath, resourceIdentifier);
             if (File.Exists(filePath)) {
                 resource.StatusCode = HttpStatusCode.OK;
@@ -297,7 +302,7 @@ namespace WebServer {
             }
             return await GetGenericStatusPageAsync(new StatusPageModel(Directory.Exists(filePath) ? HttpStatusCode.Forbidden : HttpStatusCode.NotFound), host: targetDomain);
         }
-        
+
         public async Task<HttpResponse> GetGenericStatusPageAsync(StatusPageModel pageModel, string? host = null, ExpandoObject? viewBag = null) {
             //try { pageModel.Exception ??= throw new Exception("test"); }
             //catch (Exception e) { pageModel.Exception = e; }
