@@ -13,7 +13,7 @@ namespace WebServer {
     public abstract class AreaBase { // Formally `HttpEndpointHandler`
         // Provides razor pages, resources and relevent db tables and entities
         public readonly HttpServer Server;
-        public readonly RazorLightEngine RazorEngine;
+        public readonly RazorLightEngine? RazorEngine;
         public readonly string Hostname;
         public readonly string AreaPath;
         public readonly AreaBase? ParentArea;
@@ -24,7 +24,7 @@ namespace WebServer {
             if (server == null) throw new ArgumentNullException(nameof(server));
             if (string.IsNullOrEmpty(host)) throw new ArgumentNullException(nameof(host));
             Server = server;
-            RazorEngine = server.GetOrCreateRazorEngine(host);
+            _ = server.TryGetRazorEngine(host, out RazorEngine);
             Hostname = host;
             AreaPath = areaPath ?? string.Empty;
         }

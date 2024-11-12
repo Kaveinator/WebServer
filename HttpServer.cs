@@ -46,22 +46,36 @@ namespace WebServer {
                 ViewsDirectory.CreateSubdirectory(config.DefaultDomain);
             if (config.AutoStart)
                 _ = StartAsync();
-            DefaultRazorEngine = GetOrCreateRazorEngine(config.DefaultDomain);
+
+            DefaultRazorEngine = TryGetRazorEngine(config.DefaultDomain, out var defaultEngine) ? defaultEngine
+                : throw new ApplicationException("Could not allocate default engine");
         }
 
-        public RazorLightEngine GetOrCreateRazorEngine(string hostname) {
-            hostname = hostname.Trim(' ', '/', '\\');
-            if (!RazorEngines.TryGetValue(hostname, out RazorLightEngine engine)) {
-                RazorEngines.Add(hostname, engine = new RazorLightEngineBuilder()
+        /// <summary>Attempts to create a Razor Engine for the specified domain,
+        /// can only create an engine if the domain if the root directory exists
+        /// </summary>
+        /// <param name="hostname">The hostname/domain that this engine is for</param>
+        /// <param name="razorEngine">The found or created engine (not null if this method returns true)</param>
+        /// <returns>True if the engine is defined</returns>
+        public bool TryGetRazorEngine(string hostname, out RazorLightEngine? razorEngine) {
+            razorEngine = null;
+            if (string.IsNullOrEmpty(hostname))
+                return false;
+            hostname = hostname.Trim(' ', '/', '\\', '.');
+            if (!RazorEngines.TryGetValue(hostname, out razorEngine)) {
+                string engineRootPath = Path.Combine(ViewsDirectory.FullName, hostname);
+                if (!Directory.Exists(engineRootPath))
+                    return false; // If the root path does not exist, do not allocate a razor engine
+                RazorEngines.Add(hostname, razorEngine = new RazorLightEngineBuilder()
                     .UseOptions(new RazorLightOptions() { // TODO: make this part of the config
                         EnableDebugMode = true
                     })
-                    .UseProject(new FileSystemRazorProject(Path.Combine(ViewsDirectory.FullName, hostname), ".cshtml"))
+                    .UseProject(new FileSystemRazorProject(engineRootPath, ".cshtml"))
                     .UseMemoryCachingProvider()
                     .Build()
                 );
             }
-            return engine;
+            return razorEngine != null;
         }
 
         public async Task StartAsync() {
@@ -170,9 +184,8 @@ namespace WebServer {
                     string fileName = Path.GetFileNameWithoutExtension(path);
                     bool isPrivateView = fileName.Length > 0 && fileName.StartsWith('_');
                     if (response == null && !isPrivateView) {
-                        foreach (var hostname in hostnames) {
-                            // If no razor engine exists, continue to next hostname
-                            if (!RazorEngines.TryGetValue(hostname, out var razorEngine))
+                        foreach (var hostname in hostnames) {   
+                            if (!TryGetRazorEngine(hostname, out var razorEngine))
                                 continue;
 
                             string cwd = Path.Combine(ViewsDirectory.FullName, hostname).Replace('\\', '/');
@@ -187,9 +200,11 @@ namespace WebServer {
                                 cache.StatusCode = HttpStatusCode.OK;
                                 cache.ContentString = await razorEngine.CompileRenderAsync<object?>(razorPath, null);
                                 cache.ContentType = "text/html";
+                                cache.ClearFlag();
                                 response = cache;
                                 break;
                             }
+                            if (response != null) break;
                         }
                     }
                     #endregion
@@ -258,49 +273,53 @@ namespace WebServer {
 
         public async Task<HttpResponse> GetStaticFile(HttpListenerContext context, CachedResponse? cache) => await GetStaticFile(context.Request.Url?.Host, context.Request.Url?.LocalPath, cache);
 
-        public async Task<HttpResponse> GetStaticFile(string? targetDomain, string? localPath, CachedResponse? cache) {
-            targetDomain = (targetDomain ?? Config.DefaultDomain).Trim('/', ' ').ToLowerInvariant();
-            string cacheKey = $"{targetDomain}/{FormatCallbackKey(localPath ?? "")}";
+        public async Task<HttpResponse> GetStaticFile(string? hostname, string? localPath, CachedResponse? cache) {
+            hostname = (hostname ?? Config.DefaultDomain).Trim('/', ' ').ToLowerInvariant();
+            string cacheKey = $"{hostname}/{FormatCallbackKey(localPath ?? "")}";
             if (cache is null)
-                cache = CachedResponse.Get(this, $"{targetDomain}{cacheKey}");
+                cache = CachedResponse.Get(this, $"{hostname}{cacheKey}");
             if (!(cache?.NeedsUpdate ?? true)) return cache;
-            string? fileName = Path.GetFileName(localPath);
-            if (fileName != null && fileName.StartsWith('_') && fileName.EndsWith(".cshtml")) // Is the file a private cshtml file?
-                localPath = localPath?.Substring(0, localPath.Length - fileName.Length);
-            DirectoryInfo directory = ViewsDirectory; // Might be changed later
-            // Works on windows, but on linux, the domain folder will need to be lowercase
-            string basePath = Path.Combine(directory.FullName, targetDomain);
-            bool usingFallbackDomain = !Directory.Exists(basePath);
-            if (usingFallbackDomain) { // Only fallback to default if domain folder doesn't exist
-                targetDomain = Config.DefaultDomain;
-                basePath = Path.Combine(directory.FullName, Config.DefaultDomain);
+            // No previous cache existed or this cache needs an update
+            var hostnames = new[] { hostname ?? Config.DefaultDomain, Config.DefaultDomain }.Distinct();
+            bool folderAtPathExists = false;
+            foreach (string targetDomain in hostnames) {
+                string? fileName = Path.GetFileName(localPath);
+                if (fileName != null && fileName.StartsWith('_') && fileName.EndsWith(".cshtml")) // Is the file a private cshtml file?
+                    localPath = localPath?.Substring(0, localPath.Length - fileName.Length);
+                DirectoryInfo directory = ViewsDirectory; // Might be changed later
+                                                          // Works on windows, but on linux, the domain folder must be lowercase
+                string basePath = Path.Combine(directory.FullName, targetDomain);
+                if (!Directory.Exists(basePath)) // Only fallback to default if domain folder doesn't exist
+                    continue;
+                string resourceIdentifier = FormatCallbackKey(localPath ?? string.Empty);
+                CachedResponse resource = cache ?? new CachedResponse(this, null) {
+                    Path = cacheKey
+                };
+                string filePath = Path.Combine(basePath, resourceIdentifier);
+                if (Directory.Exists(filePath)) folderAtPathExists = true;
+                if (File.Exists(filePath)) {
+                    resource.StatusCode = HttpStatusCode.OK;
+                    resource.ContentType = MimeTypeMap.GetMimeType(Path.GetExtension(filePath).ToLower());
+                    resource.Content = File.ReadAllBytes(filePath);
+                    resource.Headers["cache-control"] = Config.DebugMode ? "no-store, no-cache, must-revalidate"
+                        : "max-age=360000, s-max-age=900, stale-while-revalidate=120, stale-if-error=86400";
+                    resource.ClearFlag();
+                    return resource;
+                }
+                string? hitPath = Config.UriFillers.Select(filler => filePath + filler)
+                    .FirstOrDefault(path => path.Contains(basePath) && File.Exists(path));
+                if (hitPath != null) {
+                    resource.StatusCode = HttpStatusCode.OK;
+                    resource.ContentType = MimeTypeMap.GetMimeType(Path.GetExtension(hitPath).ToLower());
+                    resource.Content = File.ReadAllBytes(hitPath);
+                    resource.Headers["cache-control"] = Config.DebugMode ? "no-store, no-cache, must-revalidate"
+                        : "max-age=360000, s-max-age=900, stale-while-revalidate=120, stale-if-error=86400";
+                    resource.ClearFlag();
+                    return resource;
+                }
             }
-            string resourceIdentifier = FormatCallbackKey(localPath ?? string.Empty);
-            CachedResponse resource = cache ?? new CachedResponse(this, null) {
-                Path = cacheKey
-            };
-            string filePath = Path.Combine(basePath, resourceIdentifier);
-            if (File.Exists(filePath)) {
-                resource.StatusCode = HttpStatusCode.OK;
-                resource.ContentType = MimeTypeMap.GetMimeType(Path.GetExtension(filePath).ToLower());
-                resource.Content = File.ReadAllBytes(filePath);
-                resource.Headers["cache-control"] = Config.DebugMode ? "no-store, no-cache, must-revalidate"
-                    : "max-age=360000, s-max-age=900, stale-while-revalidate=120, stale-if-error=86400";
-                resource.ClearFlag();
-                return resource;
-            }
-            string? hitPath = Config.UriFillers.Select(filler => filePath + filler)
-                .FirstOrDefault(path => path.Contains(basePath) && File.Exists(path));
-            if (hitPath != null) {
-                resource.StatusCode = HttpStatusCode.OK;
-                resource.ContentType = MimeTypeMap.GetMimeType(Path.GetExtension(hitPath).ToLower());
-                resource.Content = File.ReadAllBytes(hitPath);
-                resource.Headers["cache-control"] = Config.DebugMode ? "no-store, no-cache, must-revalidate"
-                    : "max-age=360000, s-max-age=900, stale-while-revalidate=120, stale-if-error=86400";
-                resource.ClearFlag();
-                return resource;
-            }
-            return await GetGenericStatusPageAsync(new StatusPageModel(Directory.Exists(filePath) ? HttpStatusCode.Forbidden : HttpStatusCode.NotFound), host: targetDomain);
+            
+            return await GetGenericStatusPageAsync(new StatusPageModel(folderAtPathExists ? HttpStatusCode.Forbidden : HttpStatusCode.NotFound), host: hostname);
         }
 
         public async Task<HttpResponse> GetGenericStatusPageAsync(StatusPageModel pageModel, string? host = null, ExpandoObject? viewBag = null) {
@@ -310,11 +329,13 @@ namespace WebServer {
                 .Select(h => h.Trim(' ', '/', '\\'));
             const string viewName = "_StatusPage.cshtml";
             foreach (string hostname in potentialHosts) {
-                if (!File.Exists(Path.Combine(ViewsDirectory.FullName, hostname, viewName))) continue;
+                string viewPath = Path.Combine(ViewsDirectory.FullName, hostname, viewName);
+                if (!File.Exists(viewPath) || !TryGetRazorEngine(hostname, out var razorEngine))
+                    continue;
                 try {
                     return new HttpResponse(
                         pageModel.StatusCode,
-                        await GetOrCreateRazorEngine(hostname).CompileRenderAsync(viewName, pageModel, viewBag),
+                        await razorEngine.CompileRenderAsync(viewName, pageModel, viewBag),
                         MimeTypeMap.GetMimeType(".cshtml")
                     );
                 } catch (Exception ex) {
